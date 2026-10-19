@@ -59,6 +59,18 @@ tsci-agent do --prompt "Try this refactor" --dir ./somedir --sandbox
 
 `--sandbox` protects the original directory from ordinary writes by using a copy, but it is not a security boundary or container.
 
+## Agent Client Protocol (ACP) mode
+
+Run the agent as an [Agent Client Protocol](https://agentclientprotocol.com) server over stdio so ACP clients such as T3 Code / Paseo can drive it as a single CLI without a separate adapter:
+
+```bash
+tsci-agent acp
+```
+
+The agent speaks ACP JSON-RPC 2.0 on stdout/stdin and supports `initialize`, `session/new`, `session/prompt` (with streamed `session/update` notifications), `session/cancel`, `session/resume`, `session/close`, and `session/set_config_option` for the `model` and `thinkingLevel` selectors.
+
+To use it from an ACP client, register a Local ACP command with executable `tsci-agent` (or your dev entrypoint, e.g. `tsci-agent-test`) and argument `acp`. Pi SDK flags still apply, for example `--model <provider>/<model>` and `--thinking <level>`.
+
 ## Library usage
 
 You can also run the agent from another Bun/TypeScript program and inspect the sandbox after the prompt completes:
