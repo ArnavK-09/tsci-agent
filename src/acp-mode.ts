@@ -56,9 +56,7 @@ const MODEL_CONFIG_ID = "model";
 const THINKING_CONFIG_ID = "thinkingLevel";
 const ACP_PERMISSION_OPTIONS = [
   { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
-  { optionId: "allow-always", name: "Always allow", kind: "allow_always" },
   { optionId: "reject-once", name: "Reject once", kind: "reject_once" },
-  { optionId: "reject-always", name: "Always reject", kind: "reject_always" },
 ] satisfies PermissionOption[];
 
 type PiThinkingLevel = NonNullable<Args["thinking"]>;
@@ -124,7 +122,9 @@ async function requestAcpToolPermission(
 ): Promise<{ block: true; reason: string } | undefined> {
   const client = state?.client;
   const signal = state?.promptAbortController?.signal;
-  if (!client || !signal) return { block: true, reason: "No active ACP client is available to approve this tool call." };
+  if (!state || !client || !signal) {
+    return { block: true, reason: "No active ACP client is available to approve this tool call." };
+  }
   if (signal.aborted) return { block: true, reason: "Tool permission request was cancelled." };
 
   let onAbort: (() => void) | undefined;
@@ -157,10 +157,8 @@ async function requestAcpToolPermission(
     const selectedOption = ACP_PERMISSION_OPTIONS.find((option) => option.optionId === outcome.optionId);
     switch (selectedOption?.kind) {
       case "allow_once":
-      case "allow_always":
         return undefined;
       case "reject_once":
-      case "reject_always":
         return { block: true, reason: "Tool call rejected by the user." };
       default:
         return { block: true, reason: "The ACP client returned an unknown permission choice." };
