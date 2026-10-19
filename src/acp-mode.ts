@@ -12,6 +12,8 @@ import {
   type ContentBlock,
   type InitializeRequest,
   type InitializeResponse,
+  type LoadSessionRequest,
+  type LoadSessionResponse,
   type NewSessionRequest,
   type NewSessionResponse,
   type PromptRequest,
@@ -220,6 +222,132 @@ function mapEventToUpdate(event: AgentSessionEvent, messageId: string): SessionU
   }
 }
 
+function mapPiContentBlock(block: { type: "text"; text: string } | PiImageContent): ContentBlock {
+  if (block.type === "text") return { type: "text", text: block.text };
+  return { type: "image", data: block.data, mimeType: block.mimeType };
+}
+
+function mapPiContent(content: string | ({ type: "text"; text: string } | PiImageContent)[] | null | undefined): ContentBlock[] {
+  if (content == null) return [];
+  if (Array.isArray(content)) return content.map(mapPiContentBlock);
+  return [{ type: "text", text: content }];
+}
+
+async function replayAcpSessionHistory(state: AcpSessionState, sessionId: string, client: AgentContext): Promise<void> {
+  const notify = (update: SessionUpdate) => client.notify(methods.client.session.update, { sessionId, update });
+  const pendingToolCalls = new Set<string>();
+  const entries = state.sessionManager.getBranch();
+
+  for (const [index, entry] of entries.entries()) {
+    const messageId = `${sessionId}:${index}`;
+
+    if (entry.type === "custom_message") {
+      if (!entry.display) continue;
+      for (const content of mapPiContent(entry.content)) {
+        await notify({ sessionUpdate: "agent_message_chunk", messageId, content });
+      }
+      continue;
+    }
+
+    if (entry.type !== "message") continue;
+
+    const message = entry.message;
+
+    if (message.role === "user") {
+      for (const content of mapPiContent(message.content)) {
+        await notify({
+          sessionUpdate: "user_message_chunk",
+          messageId,
+          content,
+        });
+      }
+      continue;
+    }
+
+    if (message.role === "assistant") {
+      const blocks = Array.isArray(message.content) ? message.content : [];
+      for (const block of blocks) {
+        if (block.type === "text") {
+          await notify({
+            sessionUpdate: "agent_message_chunk",
+            messageId,
+            content: mapPiContentBlock(block),
+          });
+        } else if (block.type === "thinking") {
+          await notify({
+            sessionUpdate: "agent_thought_chunk",
+            messageId,
+            content: { type: "text", text: block.thinking },
+          });
+        } else if (block.type === "toolCall") {
+          pendingToolCalls.add(block.id);
+          await notify({
+            sessionUpdate: "tool_call",
+            toolCallId: block.id,
+            title: block.name,
+            name: block.name,
+            kind: mapToolKind(block.name),
+            status: "pending",
+            rawInput: block.arguments,
+          });
+        }
+      }
+      continue;
+    }
+
+    if (message.role === "toolResult") {
+      if (!pendingToolCalls.has(message.toolCallId)) continue;
+      pendingToolCalls.delete(message.toolCallId);
+      await notify({
+        sessionUpdate: "tool_call_update",
+        toolCallId: message.toolCallId,
+        status: message.isError ? "failed" : "completed",
+        content: mapPiContent(message.content).map((content) => ({ type: "content", content })),
+      });
+      continue;
+    }
+
+    if (message.role === "custom" && message.display) {
+      for (const content of mapPiContent(message.content)) {
+        await notify({
+          sessionUpdate: "agent_message_chunk",
+          messageId,
+          content,
+        });
+      }
+      continue;
+    }
+
+    if (message.role === "bashExecution") {
+      const toolCallId = `${sessionId}:bash:${index}`;
+      await notify({
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: message.command,
+        name: "bash",
+        kind: "execute",
+        status: "pending",
+        rawInput: { command: message.command },
+      });
+      await notify({
+        sessionUpdate: "tool_call_update",
+        toolCallId,
+        status: message.cancelled || message.exitCode !== 0 ? "failed" : "completed",
+        rawOutput: message.output,
+      });
+    }
+  }
+
+  for (const toolCallId of pendingToolCalls) {
+    await notify({
+      sessionUpdate: "tool_call_update",
+      toolCallId,
+      status: "failed",
+      rawOutput: "No tool result was saved for this call.",
+    });
+  }
+}
+
 async function buildAcpSessionState(
   resources: AcpSharedResources,
   sessionManager: SessionManager,
@@ -291,7 +419,7 @@ class AcpBridge {
     return {
       protocolVersion: PROTOCOL_VERSION,
       agentCapabilities: {
-        loadSession: false,
+        loadSession: true,
         promptCapabilities: { image: true },
         sessionCapabilities: { resume: {}, close: {} },
       },
@@ -309,6 +437,19 @@ class AcpBridge {
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
     const state = await resumeAcpSession(this.resources, params.sessionId, params.cwd);
     this.sessions.set(params.sessionId, state);
+    return { configOptions: this.buildConfigOptions(state) };
+  }
+
+  async loadSession(params: LoadSessionRequest, client: AgentContext): Promise<LoadSessionResponse> {
+    const state = await resumeAcpSession(this.resources, params.sessionId, params.cwd);
+    this.sessions.set(params.sessionId, state);
+    try {
+      await replayAcpSessionHistory(state, params.sessionId, client);
+    } catch (error) {
+      this.sessions.delete(params.sessionId);
+      state.session.dispose();
+      throw error;
+    }
     return { configOptions: this.buildConfigOptions(state) };
   }
 
@@ -464,6 +605,7 @@ export async function runAcpMode(args: string[]): Promise<void> {
   const app = agent({ name: "tsci-agent" })
     .onRequest(methods.agent.initialize, (ctx) => bridge.initialize(ctx.params, version))
     .onRequest(methods.agent.session.new, (ctx) => bridge.newSession(ctx.params))
+    .onRequest(methods.agent.session.load, (ctx) => bridge.loadSession(ctx.params, ctx.client))
     .onRequest(methods.agent.session.resume, (ctx) => bridge.resumeSession(ctx.params))
     .onRequest(methods.agent.session.setMode, (ctx) => bridge.setSessionMode(ctx.params))
     .onRequest(methods.agent.session.setConfigOption, (ctx) => bridge.setSessionConfigOption(ctx.params))
